@@ -3,7 +3,7 @@ const testing = std.testing;
 
 const PAGE_SIZE = 2048;
 
-pub const BTree = struct {
+pub const Node = struct {
     source: std.io.StreamSource,
     offset: u64,
     order: u64,
@@ -28,7 +28,7 @@ pub const BTree = struct {
         const writer = btree_source.writer();
         try writer.writeIntLittle(u32, 0);
         try writer.writeIntLittle(u32, 0);
-        try writer.writeByte(@enumToInt(BTreeTag.leaf));
+        try writer.writeByte(@enumToInt(NodeTag.leaf));
         try writer.writeIntLittle(u8, 0);
         try writer.writeIntLittle(u8, 0);
 
@@ -42,7 +42,7 @@ pub const BTree = struct {
         };
     }
 
-    pub const BTreeTag = enum {
+    pub const NodeTag = enum {
         internal,
         leaf,
     };
@@ -74,21 +74,21 @@ pub const BTree = struct {
         const current_kv_offset: u16 = try reader.readByte();
 
         if (current_number_of_keys >= 169) {
-            return error.BTreeFull;
+            return error.NodeFull;
         }
         if (current_kv_offset + std.math.min((key.len - 1) / 4 + 1, 64) + std.math.min((val.len - 1) / 4 + 1, 64) >= 255) {
-            return error.BTreeFull;
+            return error.NodeFull;
         }
 
         const cell_to_write_to = try this.findCellPos(key);
 
         const cell_offset = this.offset + 8 + 8 + LEAF_CELL_SIZE * switch (cell_to_write_to) {
-            .cellEmpty, .cellExists, .cellReplace => |o| o,
+            .cellEmpty, .cellExists, .cellReplace => |o| @intCast(u16, o),
         };
         const key_offset = current_kv_offset + ((key.len - 1) / 4) + 1;
         const val_offset = key_offset + ((val.len - 1) / 4) + 1;
 
-        if (key_offset > 255 or val_offset > 255) return error.BTreeFull;
+        if (key_offset > 255 or val_offset > 255) return error.NodeFull;
 
         const cell = LeafCell{
             .key_ptr = @intCast(u8, key_offset),
@@ -109,13 +109,13 @@ pub const BTree = struct {
                 const num_cells_to_move = current_number_of_keys - cell_idx;
 
                 // Read cells
-                var cells_buf: [255 * LEAF_CELL_SIZE]u8 = undefined;
-                try this.source.seekTo(this.offset + 8 + 8 + LEAF_CELL_SIZE * cell_idx);
-                std.debug.assert((try reader.readAll(cells_buf[0 .. num_cells_to_move * LEAF_CELL_SIZE])) == num_cells_to_move * LEAF_CELL_SIZE);
+                var cells_buf: [255]LeafCell = undefined;
+                try this.source.seekTo(this.offset + 8 + 8 + LEAF_CELL_SIZE * @as(u16, cell_idx));
+                try reader.readNoEof(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
 
                 // Write cells to their new location, 1 cell down
-                try this.source.seekTo(this.offset + 8 + 8 + LEAF_CELL_SIZE * (cell_idx + 1));
-                try writer.writeAll(cells_buf[0 .. num_cells_to_move * LEAF_CELL_SIZE]);
+                try this.source.seekTo(this.offset + 8 + 8 + LEAF_CELL_SIZE * (@as(u16, cell_idx) + 1));
+                try writer.writeAll(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
             },
         }
 
@@ -141,12 +141,12 @@ pub const BTree = struct {
         try this.source.seekTo(this.offset + 4 + 4 + 1); // Offset, page num, overflow page ptr, page type
         const number_of_cells = try reader.readByte();
 
-        var cell_idx: u8 = 0;
+        var cell_idx: usize = 0;
         while (cell_idx < number_of_cells) : (cell_idx += 1) {
             try this.source.seekTo(this.offset + 8 + 8 + LEAF_CELL_SIZE * cell_idx);
 
-            const key_offset = try reader.readIntLittle(u8);
-            const key_len = try reader.readIntLittle(u8);
+            const key_offset: u16 = try reader.readIntLittle(u8);
+            const key_len: u16 = try reader.readIntLittle(u8);
 
             std.debug.assert(key_len != 0xFF);
 
@@ -160,11 +160,11 @@ pub const BTree = struct {
 
             switch (std.mem.order(u8, key, bytes[0..bytes_read])) {
                 .gt => continue,
-                .eq => return FindResult{ .cellExists = cell_idx },
-                .lt => return FindResult{ .cellReplace = cell_idx },
+                .eq => return FindResult{ .cellExists = @intCast(u8, cell_idx) },
+                .lt => return FindResult{ .cellReplace = @intCast(u8, cell_idx) },
             }
         }
-        return FindResult{ .cellEmpty = cell_idx };
+        return FindResult{ .cellEmpty = @intCast(u8, cell_idx) };
     }
 
     pub fn get(this: *@This(), allocator: *std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -178,7 +178,7 @@ pub const BTree = struct {
                 try this.source.seekTo(this.offset + 8 + 8 + LEAF_CELL_SIZE * cell_pos);
 
                 var cell: LeafCell = undefined;
-                std.debug.assert((try reader.readAll(std.mem.asBytes(&cell))) == @sizeOf(LeafCell));
+                try reader.readNoEof(std.mem.asBytes(&cell));
 
                 const value = try allocator.alloc(u8, cell.val_len);
                 errdefer allocator.free(value);
@@ -195,7 +195,7 @@ pub const BTree = struct {
     }
 
     pub const RangeIterator = struct {
-        btree: *BTree,
+        btree: *Node,
         start: Limit,
         end: Limit,
         pos: u8,
@@ -304,7 +304,7 @@ test "putting data and retriving it" {
         var file = try tmp.dir.createFile("library.btree", .{ .read = true });
         defer file.close();
 
-        var library = try BTree.create(.{ .file = file }, .{});
+        var library = try Node.create(.{ .file = file }, .{});
 
         try library.put("Pride and Prejudice", "Jane Austen");
         try library.put("Worth the Candle", "Alexander Wales");
@@ -316,7 +316,7 @@ test "putting data and retriving it" {
         var file = try tmp.dir.openFile("library.btree", .{ .read = true, .write = true });
         defer file.close();
 
-        var library = BTree.init(.{ .file = file }, .{});
+        var library = Node.init(.{ .file = file }, .{});
 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -340,7 +340,7 @@ test "put a key a retrieve it" {
         var file = try tmp.dir.createFile("library.btree", .{ .read = true });
         defer file.close();
 
-        var library = try BTree.create(.{ .file = file }, .{});
+        var library = try Node.create(.{ .file = file }, .{});
 
         try library.put("Worth the Candle", "Alexander Wales");
     }
@@ -349,7 +349,7 @@ test "put a key a retrieve it" {
         var file = try tmp.dir.openFile("library.btree", .{ .read = true, .write = true });
         defer file.close();
 
-        var library = BTree.init(.{ .file = file }, .{});
+        var library = Node.init(.{ .file = file }, .{});
 
         const value = (try library.get(std.testing.allocator, "Worth the Candle")).?;
         defer std.testing.allocator.free(value);
@@ -388,7 +388,7 @@ test "iterating in lexographic order" {
         var file = try tmp.dir.createFile("library.btree", .{ .read = true });
         defer file.close();
 
-        var library = try BTree.create(.{ .file = file }, .{});
+        var library = try Node.create(.{ .file = file }, .{});
 
         for (data_shuffled) |book| {
             try library.put(book.title, book.author);
@@ -399,7 +399,7 @@ test "iterating in lexographic order" {
         var file = try tmp.dir.openFile("library.btree", .{ .read = true, .write = true });
         defer file.close();
 
-        var library = BTree.init(.{ .file = file }, .{});
+        var library = Node.init(.{ .file = file }, .{});
 
         var i: usize = 0;
         var iter = try library.range(.first, .last);
