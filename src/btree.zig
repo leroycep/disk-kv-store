@@ -8,6 +8,7 @@ const LEAF_HEADER_SIZE = 16;
 const LEAF_CELL_SIZE = @sizeOf(LeafCell);
 const INTERNAL_CELL_SIZE = @sizeOf(InternalCell);
 const MAX_INTERNAL_CELLS_LEN = @divFloor(1024 - LEAF_HEADER_SIZE, INTERNAL_CELL_SIZE);
+const MAX_FREE_LIST_LEN = @divFloor(2048 - LEAF_HEADER_SIZE, 4);
 
 pub const FileBTree = struct {
     file: std.fs.File,
@@ -17,10 +18,16 @@ pub const FileBTree = struct {
     }
 
     pub fn create(file: std.fs.File) !@This() {
-        try file.seekTo(PAGE_SIZE - 1);
+        var f = file;
+
+        try file.seekTo(2 * PAGE_SIZE - 1);
         try file.writer().writeByte(0);
 
-        return @This(){ .file = file };
+        try file.seekTo(1 * PAGE_SIZE);
+        const free_list_header = FreeListHeader{ .pageNumber = 1, .nextPageNumber = 0, .count = 0 };
+        try free_list_header.write(FileContext{ .file = &f });
+
+        return @This(){ .file = f };
     }
 
     pub fn get(this: *@This(), allocator: *std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -55,11 +62,87 @@ pub const FileBTree = struct {
         }
 
         pub fn allocNewPage(this: @This()) !u32 {
-            const stat = try this.file.stat();
-            const new_page = ((stat.size - 1) / PAGE_SIZE) + 1;
-            try this.file.seekTo(new_page * PAGE_SIZE + PAGE_SIZE - 1);
-            try this.file.writer().writeByte(0);
-            return @intCast(u32, new_page);
+            var free_list_page: u32 = 1;
+            var prev_free_list_page: u32 = free_list_page;
+
+            try this.seekTo(free_list_page * PAGE_SIZE);
+            var free_list_header = try FreeListHeader.read(this);
+
+            while (free_list_header.nextPageNumber != 0) {
+                prev_free_list_page = free_list_page;
+                free_list_page = free_list_header.nextPageNumber;
+                try this.seekTo(free_list_page * PAGE_SIZE);
+                free_list_header = try FreeListHeader.read(this);
+            }
+
+            if (free_list_header.count == 0) {
+                // Allocate from end of file
+                const stat = try this.file.stat();
+                const new_page = ((stat.size - 1) / PAGE_SIZE) + 1;
+                try this.file.seekTo(new_page * PAGE_SIZE + PAGE_SIZE - 1);
+                try this.file.writer().writeByte(0);
+                return @intCast(u32, new_page);
+            } else {
+                // Return a node from the free list
+                try this.seekTo(free_list_page * PAGE_SIZE + LEAF_HEADER_SIZE + 4 * (free_list_header.count - 1));
+                const reused_page = try this.readIntLittle(u32);
+
+                // Remove 1 from the count
+                free_list_header.count -= 1;
+
+                if (free_list_page != 1 and free_list_header.count == 0) {
+                    // Remove this free list page from the free list linked list
+                    try this.seekTo(prev_free_list_page * PAGE_SIZE + 4);
+                    try this.writeIntLittle(u32, 0);
+                } else {
+                    // Update free page header
+                    try this.seekTo(free_list_page * PAGE_SIZE);
+                    try free_list_header.write(this);
+                }
+
+                return reused_page;
+            }
+        }
+
+        pub fn freePage(this: @This(), pageNumber: u32) !void {
+            var free_list_page: u32 = 1;
+
+            try this.seekTo(free_list_page * PAGE_SIZE);
+            var free_list_header = try FreeListHeader.read(this);
+
+            while (free_list_header.count == MAX_CELLS_LEN and free_list_header.nextPageNumber != 0) {
+                free_list_page = free_list_header.nextPageNumber;
+                try this.seekTo(free_list_page * PAGE_SIZE);
+                free_list_header = try FreeListHeader.read(this);
+            }
+
+            if (free_list_header.count == MAX_CELLS_LEN) {
+                unreachable; // Handle when a free list fills up
+            }
+
+            if (std.builtin.mode == .Debug) {
+                // Check if the page number is already in the free list
+                var i: u64 = 0;
+                while (i < free_list_header.count) : (i += 1) {
+                    try this.seekTo(free_list_page * PAGE_SIZE + LEAF_HEADER_SIZE + 4 * i);
+                    const freed_page = try this.readIntLittle(u32);
+                    std.debug.assert(pageNumber != freed_page); // There is a duplicate page in the free list!
+                }
+            }
+
+            try this.seekTo(free_list_page * PAGE_SIZE + LEAF_HEADER_SIZE + 4 * free_list_header.count);
+            try this.writeIntLittle(u32, pageNumber);
+
+            free_list_header.count += 1;
+
+            try this.seekTo(free_list_page * PAGE_SIZE);
+            try free_list_header.write(this);
+
+            if (std.builtin.mode == .Debug) {
+                try this.seekTo(pageNumber * PAGE_SIZE);
+                const debug_buffer = [_]u8{0xAA} ** PAGE_SIZE;
+                try this.writeAll(&debug_buffer);
+            }
         }
     };
 };
@@ -146,6 +229,12 @@ pub const MemoryBTree = struct {
             _ = this;
             unreachable;
         }
+
+        pub fn freePage(this: @This(), pageNumber: u32) !void {
+            _ = this;
+            _ = pageNumber;
+            unreachable;
+        }
     };
 };
 
@@ -226,7 +315,13 @@ const raw = struct {
             node_path = node_path_buf[0..node_path_len];
 
             try context.seekTo(node_path[node_path.len - 1] * PAGE_SIZE);
-            page_header = try NodeHeader.read(context);
+            page_header = NodeHeader.read(context) catch |err| switch (err) {
+                error.InvalidEnumTag => {
+                    std.log.warn("node_path = {any}", .{node_path});
+                    return err;
+                },
+                else => return err,
+            };
         }
 
         putLeaf(context, &page_header, key, val) catch |err| switch (err) {
@@ -331,6 +426,11 @@ const raw = struct {
     /// Does not read data longer than 0xFE bytes
     fn readData(context: anytype, header: NodeHeader, ptr: u8, buffer: []u8) !void {
         comptime if (!isContext(@TypeOf(context))) unreachable;
+        if (!(header.endOfData >= ptr)) {
+            std.log.warn("", .{});
+            std.log.warn("header = {}", .{header});
+            std.log.warn("ptr = {}", .{ptr});
+        }
         std.debug.assert(header.endOfData >= ptr);
         std.debug.assert(buffer.len < 0xFF);
 
@@ -545,6 +645,9 @@ const raw = struct {
                     .endOfData = 0,
                     .numberOfCells = 0,
                 };
+                try context.seekTo(new_leaf_left.pageNumber * PAGE_SIZE);
+                try new_leaf_left.write(context);
+
                 var new_leaf_right = NodeHeader{
                     .pageNumber = try context.allocNewPage(),
                     .overflowPageNumber = 0,
@@ -552,6 +655,8 @@ const raw = struct {
                     .endOfData = 0,
                     .numberOfCells = 0,
                 };
+                try context.seekTo(new_leaf_right.pageNumber * PAGE_SIZE);
+                try new_leaf_right.write(context);
 
                 var left_key_buf: [256]u8 = undefined;
                 var left_key: ?[]u8 = null;
@@ -618,7 +723,6 @@ const raw = struct {
                     try putInternal(context, &header, left_key.?, new_leaf_left.pageNumber);
                     try putInternal(context, &header, right_key.?, new_leaf_right.pageNumber);
                 } else {
-                    // TODO: Reclaim unused page
                     const parent_page = path[path.len - 2];
                     try context.seekTo(parent_page * PAGE_SIZE);
                     var parent_header = try NodeHeader.read(context);
@@ -630,6 +734,8 @@ const raw = struct {
                     try deleteInternalByChild(context, &parent_header, header.pageNumber);
                     try putInternal(context, &parent_header, left_key.?, new_leaf_left.pageNumber);
                     try putInternal(context, &parent_header, right_key.?, new_leaf_right.pageNumber);
+
+                    try context.freePage(header.pageNumber);
                 }
             },
         }
@@ -674,6 +780,34 @@ pub const NodeHeader = struct {
         try context.writeIntLittle(u8, @enumToInt(this.pageType));
         try context.writeIntLittle(u8, this.endOfData);
         try context.writeIntLittle(u8, this.numberOfCells);
+    }
+};
+
+pub const FreeListHeader = struct {
+    pageNumber: u32,
+    nextPageNumber: u32,
+    count: u16,
+
+    pub fn read(context: anytype) !@This() {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+
+        const page_number = try context.readIntLittle(u32);
+        const next_page_number = try context.readIntLittle(u32);
+        const count = try context.readIntLittle(u16);
+
+        return @This(){
+            .pageNumber = page_number,
+            .nextPageNumber = next_page_number,
+            .count = count,
+        };
+    }
+
+    pub fn write(this: @This(), context: anytype) !void {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+
+        try context.writeIntLittle(u32, this.pageNumber);
+        try context.writeIntLittle(u32, this.nextPageNumber);
+        try context.writeIntLittle(u16, this.count);
     }
 };
 
@@ -885,7 +1019,7 @@ test "iterating in lexographic order" {
 
 test "storing 10000 keys" {
     var tmp = testing.tmpDir(.{});
-    //defer tmp.cleanup();
+    defer tmp.cleanup();
 
     var file = try tmp.dir.createFile("many_keys.btree", .{ .read = true });
     defer file.close();
