@@ -6,6 +6,8 @@ const PAGE_SIZE = 2048;
 const MAX_CELLS_LEN = 252;
 const LEAF_HEADER_SIZE = 16;
 const LEAF_CELL_SIZE = @sizeOf(LeafCell);
+const INTERNAL_CELL_SIZE = @sizeOf(InternalCell);
+const MAX_INTERNAL_CELLS_LEN = @divFloor(1024 - LEAF_HEADER_SIZE, INTERNAL_CELL_SIZE);
 
 pub const FileBTree = struct {
     file: std.fs.File,
@@ -50,6 +52,14 @@ pub const FileBTree = struct {
 
         pub fn writeAll(this: @This(), buffer: []const u8) !void {
             return try this.file.writer().writeAll(buffer);
+        }
+
+        pub fn allocNewPage(this: @This()) !u32 {
+            const stat = try this.file.stat();
+            const new_page = ((stat.size - 1) / PAGE_SIZE) + 1;
+            try this.file.seekTo(new_page * PAGE_SIZE + PAGE_SIZE - 1);
+            try this.file.writer().writeByte(0);
+            return @intCast(u32, new_page);
         }
     };
 };
@@ -131,6 +141,11 @@ pub const MemoryBTree = struct {
                 try this.btree.memory.writer().writeAll(buffer);
             }
         }
+
+        pub fn allocNewPage(this: @This()) !u32 {
+            _ = this;
+            unreachable;
+        }
     };
 };
 
@@ -147,8 +162,27 @@ const raw = struct {
         comptime if (!isContext(@TypeOf(context))) unreachable;
         std.debug.assert(key.len > 0);
 
-        try context.seekTo(0);
-        const page_header = try NodeHeader.read(context);
+        var node_page: usize = 0;
+
+        try context.seekTo(node_page * PAGE_SIZE);
+        var page_header = try NodeHeader.read(context);
+
+        // Keep traversing internal pages until we find a leaf node
+        while (page_header.pageType == .internal) {
+            // Find child node in internal node
+            const find_res = try findInternalCellPos(context, page_header, key);
+
+            const cell = if (find_res.cell) |c| c else read_prev_cell: {
+                std.debug.assert(!find_res.isKey);
+                std.debug.assert(find_res.index > 0);
+                break :read_prev_cell try readInternalCell(context, page_header, find_res.index - 1);
+            };
+
+            // append child node page number to node_path
+            node_page = cell.child_node;
+            try context.seekTo(node_page * PAGE_SIZE);
+            page_header = try NodeHeader.read(context);
+        }
 
         const pos = try findLeafCellPos(context, page_header, key);
         if (pos.cell == null or !pos.isKey) return null;
@@ -162,10 +196,56 @@ const raw = struct {
 
     fn put(context: anytype, key: []const u8, val: []const u8) !void {
         comptime if (!isContext(@TypeOf(context))) unreachable;
-        try context.seekTo(0);
-        const page_header = try NodeHeader.read(context);
 
-        try putLeaf(context, page_header, key, val);
+        var node_path_buf: [255]u32 = undefined;
+        node_path_buf[0] = 0;
+        var node_path_len: usize = 1;
+        var node_path = node_path_buf[0..node_path_len];
+
+        try context.seekTo(node_path[node_path.len - 1] * PAGE_SIZE);
+        var page_header = try NodeHeader.read(context);
+
+        // TODO: Make this work with multiple levels of internal nodes
+        var update_rightmost_value = false;
+
+        while (page_header.pageType == .internal) {
+            // Find child node in internal node
+            const find_res = try findInternalCellPos(context, page_header, key);
+
+            const cell = if (find_res.cell) |c| c else read_prev_cell: {
+                std.debug.assert(!find_res.isKey);
+                std.debug.assert(find_res.index > 0);
+                update_rightmost_value = true;
+                break :read_prev_cell try readInternalCell(context, page_header, find_res.index - 1);
+            };
+
+            // append child node page number to node_path
+            if (node_path.len >= node_path_buf.len) return error.BTreeFull;
+            node_path_buf[node_path.len] = cell.child_node;
+            node_path_len += 1;
+            node_path = node_path_buf[0..node_path_len];
+
+            try context.seekTo(node_path[node_path.len - 1] * PAGE_SIZE);
+            page_header = try NodeHeader.read(context);
+        }
+
+        putLeaf(context, &page_header, key, val) catch |err| switch (err) {
+            error.NodeFull => {
+                try splitNodeAndInsertKV(context, node_path, key, val);
+                return;
+            },
+            else => |e| return e,
+        };
+
+        if (update_rightmost_value) {
+            const child_node = page_header.pageNumber;
+
+            try context.seekTo(node_path[node_path.len - 2] * PAGE_SIZE);
+            page_header = try NodeHeader.read(context);
+
+            try deleteInternalByChild(context, &page_header, child_node);
+            try putInternal(context, &page_header, key, child_node);
+        }
     }
 
     const LeafFindResult = struct {
@@ -208,6 +288,46 @@ const raw = struct {
         return cell;
     }
 
+    const InternalFindResult = struct {
+        index: u8,
+        cell: ?InternalCell,
+        isKey: bool, // Existing cell is the correct key
+    };
+
+    fn findInternalCellPos(context: anytype, header: NodeHeader, key: []const u8) !InternalFindResult {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+        std.debug.assert(header.pageType == .internal);
+
+        var cell_idx: usize = 0;
+        while (cell_idx < header.numberOfCells) : (cell_idx += 1) {
+            const cell = try readInternalCell(context, header, @intCast(u8, cell_idx));
+
+            // TODO: Handle keys that go into the overflow
+            var bytes: [255]u8 = undefined;
+            const cell_key = bytes[0..cell.key_len];
+            try readData(context, header, cell.key_ptr, cell_key);
+
+            switch (std.mem.order(u8, key, cell_key)) {
+                .gt => continue,
+                .eq => return InternalFindResult{ .index = @intCast(u8, cell_idx), .cell = cell, .isKey = true },
+                .lt => return InternalFindResult{ .index = @intCast(u8, cell_idx), .cell = cell, .isKey = false },
+            }
+        }
+        return InternalFindResult{ .index = @intCast(u8, cell_idx), .cell = null, .isKey = false };
+    }
+
+    fn readInternalCell(context: anytype, header: NodeHeader, cell_index: u8) !InternalCell {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+        std.debug.assert(header.pageType == .internal);
+        std.debug.assert(cell_index < MAX_CELLS_LEN);
+        if (cell_index >= header.numberOfCells) return error.OutOfBounds; // The requested cell index is beyond the end of the cell array
+
+        try context.seekTo(header.pageNumber * PAGE_SIZE + LEAF_HEADER_SIZE + INTERNAL_CELL_SIZE * @as(u64, cell_index));
+        const cell = try InternalCell.read(context);
+
+        return cell;
+    }
+
     /// Does not read data longer than 0xFE bytes
     fn readData(context: anytype, header: NodeHeader, ptr: u8, buffer: []u8) !void {
         comptime if (!isContext(@TypeOf(context))) unreachable;
@@ -218,9 +338,8 @@ const raw = struct {
         try context.readNoEof(buffer);
     }
 
-    fn putLeaf(context: anytype, oldHeader: NodeHeader, key: []const u8, val: []const u8) !void {
+    fn putLeaf(context: anytype, header: *NodeHeader, key: []const u8, val: []const u8) !void {
         comptime if (!isContext(@TypeOf(context))) unreachable;
-        var header = oldHeader;
         std.debug.assert(header.pageType == .leaf);
         std.debug.assert(key.len > 0); // key length must be greater than zero
 
@@ -238,10 +357,17 @@ const raw = struct {
             return error.NodeFull;
         }
 
-        const key_ptr = header.endOfData + ((key.len - 1) / 4) + 1;
-        const val_ptr = key_ptr + ((val.len - 1) / 4) + 1;
+        const find_res = try findLeafCellPos(context, header.*, key);
 
-        const find_res = try findLeafCellPos(context, header, key);
+        const key_ptr = calc_key_ptr: {
+            if (find_res.isKey) {
+                break :calc_key_ptr find_res.cell.?.key_ptr;
+            } else {
+                header.endOfData += @intCast(u8, ((key.len - 1) / 4) + 1);
+                break :calc_key_ptr header.endOfData;
+            }
+        };
+        const val_ptr = header.endOfData + ((val.len - 1) / 4) + 1;
 
         header.numberOfCells += if (!find_res.isKey) @as(u8, 1) else 0;
         header.endOfData = @intCast(u8, val_ptr);
@@ -262,14 +388,114 @@ const raw = struct {
             try context.writeAll(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
         }
 
-        try writeLeafCell(context, header, find_res.index, .{
+        try writeLeafCell(context, header.*, find_res.index, .{
             .key_ptr = @intCast(u8, key_ptr),
             .key_len = @intCast(u8, key.len),
             .val_ptr = @intCast(u8, val_ptr),
             .val_len = @intCast(u8, val.len),
         });
-        try writeData(context, header, @intCast(u8, val_ptr), val);
-        try writeData(context, header, @intCast(u8, key_ptr), key);
+        try writeData(context, header.*, @intCast(u8, val_ptr), val);
+        if (!find_res.isKey) {
+            try writeData(context, header.*, @intCast(u8, key_ptr), key);
+        }
+    }
+
+    fn putInternal(context: anytype, header: *NodeHeader, key: []const u8, childNode: u32) !void {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+        std.debug.assert(header.pageType == .internal);
+        std.debug.assert(key.len > 0); // key length must be greater than zero
+
+        if (key.len > 0xFF) unreachable; // TODO: Remove this restriction by placing data in an overflow page
+
+        if (header.numberOfCells >= MAX_CELLS_LEN) {
+            return error.NodeFull;
+        }
+
+        const key_align_len: usize = (key.len - 1) / 4 + 1;
+        const new_end_of_data: usize = header.endOfData + std.math.min(key_align_len, 64);
+
+        if (new_end_of_data >= 255) {
+            return error.NodeFull;
+        }
+
+        const find_res = try findInternalCellPos(context, header.*, key);
+
+        const key_ptr = calc_key_ptr: {
+            if (find_res.isKey) {
+                break :calc_key_ptr find_res.cell.?.key_ptr;
+            } else {
+                header.endOfData += @intCast(u8, ((key.len - 1) / 4) + 1);
+                break :calc_key_ptr header.endOfData;
+            }
+        };
+
+        header.numberOfCells += if (!find_res.isKey) @as(u8, 1) else 0;
+        header.endOfData = @intCast(u8, key_ptr);
+        try context.seekTo(header.pageNumber * PAGE_SIZE);
+        try header.write(context);
+
+        if (find_res.cell != null and !find_res.isKey) {
+            // Move all cells after cell index
+            const num_cells_to_move = header.numberOfCells - 1 - find_res.index;
+
+            // Read cells
+            var cells_buf: [255]InternalCell = undefined;
+            try context.seekTo(header.pageNumber * PAGE_SIZE + LEAF_HEADER_SIZE + INTERNAL_CELL_SIZE * @as(u64, find_res.index));
+            try context.readNoEof(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
+
+            // Write cells to their new location, 1 cell down
+            try context.seekTo(header.pageNumber * PAGE_SIZE + LEAF_HEADER_SIZE + INTERNAL_CELL_SIZE * (@as(u64, find_res.index) + 1));
+            try context.writeAll(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
+        }
+
+        try writeInternalCell(context, header.*, find_res.index, .{
+            .key_ptr = @intCast(u8, key_ptr),
+            .key_len = @intCast(u8, key.len),
+            .child_node = childNode,
+        });
+        if (!find_res.isKey) {
+            try writeData(context, header.*, @intCast(u8, key_ptr), key);
+        }
+    }
+
+    fn deleteInternalByChild(context: anytype, header: *NodeHeader, childNode: u32) !void {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+        std.debug.assert(header.pageType == .internal);
+
+        var cell_idx: usize = 0;
+        while (cell_idx < header.numberOfCells) : (cell_idx += 1) {
+            const cell = try readInternalCell(context, header.*, @intCast(u8, cell_idx));
+            if (cell.child_node == childNode) {
+                if (cell_idx != header.numberOfCells - 1) {
+                    // cell is in the middle of the list, we need to move all cells one to left
+                    // Move all cells after cell index
+                    const num_cells_to_move = header.numberOfCells - 1 - cell_idx;
+
+                    // Read cells
+                    var cells_buf: [255]InternalCell = undefined;
+                    try context.seekTo(header.pageNumber * PAGE_SIZE + LEAF_HEADER_SIZE + INTERNAL_CELL_SIZE * (@as(u64, cell_idx) + 1));
+                    try context.readNoEof(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
+
+                    // Write cells to their new location, 1 cell down
+                    try context.seekTo(header.pageNumber * PAGE_SIZE + LEAF_HEADER_SIZE + INTERNAL_CELL_SIZE * @as(u64, cell_idx));
+                    try context.writeAll(std.mem.sliceAsBytes(cells_buf[0..num_cells_to_move]));
+                }
+
+                header.numberOfCells -= 1;
+
+                // Key ptr is at the end of the data, we decrement the endOfData by the aligned key len
+                if (cell.key_ptr == header.endOfData) {
+                    header.endOfData -= (cell.key_len - 1) / 4 + 1;
+                }
+
+                try context.seekTo(header.pageNumber * PAGE_SIZE);
+                try header.write(context);
+
+                return;
+            }
+        }
+
+        return error.NotFound;
     }
 
     fn writeLeafCell(context: anytype, header: NodeHeader, cell_index: u8, cell: LeafCell) !void {
@@ -282,12 +508,131 @@ const raw = struct {
         try context.writeAll(std.mem.asBytes(&cell));
     }
 
+    fn writeInternalCell(context: anytype, header: NodeHeader, cell_index: u8, cell: InternalCell) !void {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+        std.debug.assert(header.pageType == .internal);
+        std.debug.assert(cell_index < MAX_CELLS_LEN);
+
+        try context.seekTo(header.pageNumber * PAGE_SIZE + LEAF_HEADER_SIZE + INTERNAL_CELL_SIZE * @as(u64, cell_index));
+
+        try context.writeAll(std.mem.asBytes(&cell));
+    }
+
     fn writeData(context: anytype, header: NodeHeader, ptr: u8, buffer: []const u8) !void {
         comptime if (!isContext(@TypeOf(context))) unreachable;
         std.debug.assert(buffer.len < 0xFF);
 
         try context.seekTo(header.pageNumber * PAGE_SIZE + PAGE_SIZE - @as(u64, ptr) * 4);
         try context.writeAll(buffer);
+    }
+
+    fn splitNodeAndInsertKV(context: anytype, path: []const u32, new_key: []const u8, new_val: []const u8) !void {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
+        std.debug.assert(path.len > 0);
+
+        try context.seekTo(path[path.len - 1] * PAGE_SIZE);
+        var header = try NodeHeader.read(context);
+
+        const midpoint = header.numberOfCells / 2;
+
+        switch (header.pageType) {
+            .internal => unreachable,
+            .leaf => {
+                var new_leaf_left = NodeHeader{
+                    .pageNumber = try context.allocNewPage(),
+                    .overflowPageNumber = 0,
+                    .pageType = .leaf,
+                    .endOfData = 0,
+                    .numberOfCells = 0,
+                };
+                var new_leaf_right = NodeHeader{
+                    .pageNumber = try context.allocNewPage(),
+                    .overflowPageNumber = 0,
+                    .pageType = .leaf,
+                    .endOfData = 0,
+                    .numberOfCells = 0,
+                };
+
+                var left_key_buf: [256]u8 = undefined;
+                var left_key: ?[]u8 = null;
+                var right_key_buf: [256]u8 = undefined;
+                var right_key: ?[]u8 = null;
+
+                // Copy left keys
+                var i: usize = 0;
+                while (i < midpoint) : (i += 1) {
+                    const cell = try readLeafCell(context, header, @intCast(u8, i));
+
+                    std.debug.assert(cell.key_len < 0xFF);
+                    std.debug.assert(cell.val_len < 0xFF);
+
+                    // read key
+                    left_key = left_key_buf[0..cell.key_len];
+                    try readData(context, header, cell.key_ptr, left_key.?);
+
+                    // read val
+                    var val_buf: [256]u8 = undefined;
+                    const val = val_buf[0..cell.val_len];
+                    try readData(context, header, cell.val_ptr, val);
+
+                    // put in left cell
+                    try putLeaf(context, &new_leaf_left, left_key.?, val);
+                }
+
+                // Copy right keys
+                while (i < header.numberOfCells) : (i += 1) {
+                    const cell = try readLeafCell(context, header, @intCast(u8, i));
+
+                    std.debug.assert(cell.key_len < 0xFF);
+                    std.debug.assert(cell.val_len < 0xFF);
+
+                    // read key
+                    right_key = right_key_buf[0..cell.key_len];
+                    try readData(context, header, cell.key_ptr, right_key.?);
+
+                    // read val
+                    var val_buf: [256]u8 = undefined;
+                    const val = val_buf[0..cell.val_len];
+                    try readData(context, header, cell.val_ptr, val);
+
+                    // put in right cell
+                    try putLeaf(context, &new_leaf_right, right_key.?, val);
+                }
+
+                if (std.mem.order(u8, new_key, left_key.?) != .gt) {
+                    try putLeaf(context, &new_leaf_left, new_key, new_val);
+                } else if (std.mem.order(u8, new_key, right_key.?) != .gt) {
+                    try putLeaf(context, &new_leaf_right, new_key, new_val);
+                } else {
+                    try putLeaf(context, &new_leaf_right, new_key, new_val);
+                    right_key = right_key_buf[0..new_key.len];
+                    std.mem.copy(u8, right_key.?, new_key);
+                }
+
+                if (header.pageNumber == 0) {
+                    header.overflowPageNumber = 0;
+                    header.pageType = .internal;
+                    header.endOfData = 0;
+                    header.numberOfCells = 0;
+
+                    try putInternal(context, &header, left_key.?, new_leaf_left.pageNumber);
+                    try putInternal(context, &header, right_key.?, new_leaf_right.pageNumber);
+                } else {
+                    // TODO: Reclaim unused page
+                    const parent_page = path[path.len - 2];
+                    try context.seekTo(parent_page * PAGE_SIZE);
+                    var parent_header = try NodeHeader.read(context);
+
+                    if (parent_header.numberOfCells >= MAX_CELLS_LEN) {
+                        return error.BTreeFull;
+                    }
+
+                    try deleteInternalByChild(context, &parent_header, header.pageNumber);
+                    try putInternal(context, &parent_header, left_key.?, new_leaf_left.pageNumber);
+                    try putInternal(context, &parent_header, right_key.?, new_leaf_right.pageNumber);
+                }
+            },
+        }
     }
 };
 
@@ -348,111 +693,18 @@ const LeafCell = packed struct {
     }
 };
 
-pub const LeafNode = struct {
-    pageNumber: u32,
-    overflowPageNumber: u32,
-    endOfData: u8,
-    numberOfCells: u8,
+const InternalCell = packed struct {
+    key_ptr: u8,
+    key_len: u8,
+    child_node: u32,
 
-    pub const RangeIterator = struct {
-        btree: *LeafNode,
-        start: Limit,
-        end: Limit,
-        pos: u8,
-        dir: Direction,
-        cellsInPage: u8,
+    pub fn read(context: anytype) !@This() {
+        comptime if (!isContext(@TypeOf(context))) unreachable;
 
-        pub fn nextEntry(this: *@This(), allocator: *std.mem.Allocator) !?Entry {
-            if (this.dir == .forwards and this.pos >= this.cellsInPage) return null;
-            if (this.dir == .backwards and this.pos == 0) return null;
+        var cell: @This() = undefined;
+        try context.readNoEof(std.mem.asBytes(&cell));
 
-            const pos = if (this.dir == .backwards) this.pos - 1 else this.pos;
-
-            switch (this.dir) {
-                .forwards => this.pos += 1,
-                .backwards => this.pos -= 1,
-            }
-
-            try this.btree.source.seekTo(this.btree.offset + 8 + 8 + LEAF_CELL_SIZE * pos);
-
-            const reader = this.btree.source.reader();
-
-            var cell: LeafCell = undefined;
-            std.debug.assert((try reader.readAll(std.mem.asBytes(&cell))) == @sizeOf(LeafCell));
-
-            const key = try allocator.alloc(u8, cell.key_len);
-            errdefer allocator.free(key);
-
-            try this.btree.source.seekTo(this.btree.offset + PAGE_SIZE - cell.key_ptr * 4);
-            const key_bytes_read = try reader.readAll(key);
-            if (key_bytes_read < key.len) {
-                return error.UnexpectedEOF;
-            }
-
-            const value = try allocator.alloc(u8, cell.val_len);
-            errdefer allocator.free(value);
-
-            try this.btree.source.seekTo(this.btree.offset + PAGE_SIZE - cell.val_ptr * 4);
-            const val_bytes_read = try reader.readAll(value);
-            if (val_bytes_read < value.len) {
-                return error.UnexpectedEOF;
-            }
-
-            return Entry{
-                .allocator = allocator,
-                .key = key,
-                .val = value,
-            };
-        }
-    };
-
-    pub const Entry = struct {
-        allocator: *std.mem.Allocator,
-        key: []const u8,
-        val: []const u8,
-
-        pub fn deinit(this: @This()) void {
-            this.allocator.free(this.key);
-            this.allocator.free(this.val);
-        }
-    };
-
-    pub const Limit = union(enum) {
-        first,
-        last,
-    };
-
-    pub const Direction = enum {
-        forwards,
-        backwards,
-    };
-
-    pub fn range(this: *@This(), start: Limit, end: Limit) !RangeIterator {
-        std.debug.assert(!std.meta.eql(start, end));
-
-        try this.source.seekTo(this.offset + 8 + 1);
-        const cells_in_page = try this.source.reader().readByte();
-
-        return RangeIterator{
-            .btree = this,
-            .start = start,
-            .end = end,
-            .pos = switch (start) {
-                .first => 0,
-                .last => cells_in_page,
-            },
-            .dir = switch (start) {
-                .first => switch (end) {
-                    .first => unreachable,
-                    .last => .forwards,
-                },
-                .last => switch (end) {
-                    .first => .backwards,
-                    .last => unreachable,
-                },
-            },
-            .cellsInPage = cells_in_page,
-        };
+        return cell;
     }
 };
 
@@ -542,6 +794,32 @@ test "put a key and retrieve it" {
     }
 }
 
+test "put a key, overwrite it, and retrieve it" {
+    var tmp = testing.tmpDir(.{});
+    //defer tmp.cleanup();
+
+    {
+        var file = try tmp.dir.createFile("fridge.btree", .{ .read = true });
+        defer file.close();
+
+        var fridge = try FileBTree.create(file);
+
+        try fridge.put("Eggs", "6");
+        try fridge.put("Eggs", "3");
+    }
+
+    {
+        var file = try tmp.dir.openFile("fridge.btree", .{ .read = true, .write = true });
+        defer file.close();
+
+        var fridge = try FileBTree.init(file);
+
+        const value = (try fridge.get(std.testing.allocator, "Eggs")).?;
+        defer std.testing.allocator.free(value);
+        try testing.expectEqualStrings("3", value);
+    }
+}
+
 test "iterating in lexographic order" {
     if (true) return;
 
@@ -572,7 +850,7 @@ test "iterating in lexographic order" {
         var file = try tmp.dir.createFile("library.btree", .{ .read = true });
         defer file.close();
 
-        var library = try LeafNode.create(.{ .file = file }, .{});
+        var library = try FileBTree.create(.{ .file = file }, .{});
 
         for (data_shuffled) |book| {
             try library.put(book.title, book.author);
@@ -583,7 +861,7 @@ test "iterating in lexographic order" {
         var file = try tmp.dir.openFile("library.btree", .{ .read = true, .write = true });
         defer file.close();
 
-        var library = LeafNode.init(.{ .file = file }, .{});
+        var library = FileBTree.init(.{ .file = file }, .{});
 
         var i: usize = 0;
         var iter = try library.range(.first, .last);
@@ -606,17 +884,15 @@ test "iterating in lexographic order" {
 }
 
 test "storing 10000 keys" {
-    if (true) return;
-
     var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+    //defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("many_keys.btree", .{ .read = true });
+    defer file.close();
+
+    var library = try FileBTree.create(file);
 
     {
-        var file = try tmp.dir.createFile("many_keys.btree", .{ .read = true });
-        defer file.close();
-
-        var library = try LeafNode.create(.{ .file = file }, .{});
-
         var i: usize = 0;
         while (i < 10000) : (i += 1) {
             var key_buf: [20]u8 = undefined;
@@ -626,6 +902,24 @@ test "storing 10000 keys" {
             const val = try std.fmt.bufPrint(&val_buf, "{}", .{i});
 
             try library.put(key, val);
+        }
+    }
+
+    {
+        var i: usize = 0;
+        while (i < 10000) : (i += 1) {
+            var key_buf: [20]u8 = undefined;
+            var val_buf: [20]u8 = undefined;
+
+            const key = try std.fmt.bufPrint(&key_buf, "{x}", .{i});
+            const val = try std.fmt.bufPrint(&val_buf, "{}", .{i});
+
+            const val_in_btree = try library.get(std.testing.allocator, key);
+
+            try std.testing.expect(val_in_btree != null);
+            defer std.testing.allocator.free(val_in_btree.?);
+
+            try std.testing.expectEqualStrings(val, val_in_btree.?);
         }
     }
 }
