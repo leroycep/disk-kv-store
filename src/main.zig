@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const fs = std.fs;
 const btree = @import("btree.zig");
+const path_trie = @import("path_trie.zig");
 
 pub const Database = struct {
     file: fs.File,
