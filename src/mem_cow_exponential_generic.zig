@@ -234,6 +234,27 @@ pub fn Tree(comptime K: type, V: type) type {
             this.root.?.dumpTree(stdout.writer()) catch unreachable;
         }
 
+        pub fn countBytesUsed(this: *const @This()) usize {
+            if (this.root) |root| {
+                return root.countBytesUsed();
+            }
+
+            return 0;
+        }
+
+        pub fn countBytesInAllocationCache(this: *const @This()) usize {
+            var bytes_used: usize = 0;
+
+            var iter = this.freeMemory.iterator();
+            while (iter.next()) |free_slots_entry| {
+                const slot_size = free_slots_entry.key_ptr.*;
+                const len = free_slots_entry.value_ptr.items.len;
+                bytes_used += slot_size * len;
+            }
+
+            return bytes_used;
+        }
+
         const Node = struct {
             nodeType: NodeType,
             len: usize,
@@ -656,6 +677,18 @@ pub fn Tree(comptime K: type, V: type) type {
                         }
                     },
                 }
+            }
+
+            fn countBytesUsed(this: *const @This()) usize {
+                var bytes_used: usize = nodeSize(this.nodeType, this.len);
+                if (this.nodeType == .internal) {
+                    const entries = this.constInternalEntryArray();
+
+                    for (entries) |entry| {
+                        bytes_used += entry.node.countBytesUsed();
+                    }
+                }
+                return bytes_used;
             }
         };
 
