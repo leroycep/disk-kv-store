@@ -6,6 +6,7 @@ pub fn Tree(comptime K: type, V: type) type {
 
     return struct {
         allocator: *std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
         rng: std.rand.DefaultPrng,
         root: ?*Node,
         freeMemory: std.AutoHashMap(usize, std.ArrayList([*]align(@alignOf(*Node)) u8)),
@@ -15,6 +16,7 @@ pub fn Tree(comptime K: type, V: type) type {
         pub fn init(allocator: *std.mem.Allocator) @This() {
             return @This(){
                 .allocator = allocator,
+                .arena = std.heap.ArenaAllocator.init(allocator),
                 .rng = std.rand.DefaultPrng.init(std.crypto.random.int(u64)),
                 .root = null,
                 .freeMemory = std.AutoHashMap(usize, std.ArrayList([*]align(@alignOf(*Node)) u8)).init(allocator),
@@ -22,19 +24,12 @@ pub fn Tree(comptime K: type, V: type) type {
         }
 
         pub fn deinit(this: *@This()) void {
-            if (this.root) |root| {
-                root.deinitRecursive(this.allocator);
-            }
-
             var iter = this.freeMemory.iterator();
             while (iter.next()) |slots_of_size| {
-                const size = slots_of_size.key_ptr.*;
-                for (slots_of_size.value_ptr.items) |slot| {
-                    this.allocator.free(slot[0..size]);
-                }
                 slots_of_size.value_ptr.deinit();
             }
             this.freeMemory.deinit();
+            this.arena.deinit();
         }
 
         fn allocateMem(this: *@This(), size: usize) ![]align(@alignOf(*Node)) u8 {
@@ -45,22 +40,16 @@ pub fn Tree(comptime K: type, V: type) type {
                 return slot[0..size];
             }
 
-            return try this.allocator.allocAdvanced(u8, @alignOf(*Node), size, .exact);
+            return try this.arena.allocator.allocAdvanced(u8, @alignOf(*Node), size, .exact);
         }
 
         fn freeMem(this: *@This(), slice: []align(@alignOf(*Node)) u8) void {
-            attempt_reuse: {
-                const free_slots_entry = this.freeMemory.getOrPut(slice.len) catch break :attempt_reuse;
-                if (!free_slots_entry.found_existing) {
-                    free_slots_entry.value_ptr.* = std.ArrayList([*]align(@alignOf(*Node)) u8).init(this.allocator);
-                }
-                const free_slots = free_slots_entry.value_ptr;
-                free_slots.append(slice.ptr) catch break :attempt_reuse;
-                return;
+            const free_slots_entry = this.freeMemory.getOrPut(slice.len) catch return;
+            if (!free_slots_entry.found_existing) {
+                free_slots_entry.value_ptr.* = std.ArrayList([*]align(@alignOf(*Node)) u8).init(this.allocator);
             }
-
-            this.allocator.free(slice);
-            return;
+            const free_slots = free_slots_entry.value_ptr;
+            free_slots.append(slice.ptr) catch return;
         }
 
         pub fn get(this: @This(), key: K) ?V {
@@ -71,9 +60,6 @@ pub fn Tree(comptime K: type, V: type) type {
             const path = this.pathToLocation(key) catch unreachable;
             const leaf = path.constSlice()[path.len - 1];
             const leaf_entries = leaf.node.asLeafEntryArray();
-
-            //std.log.warn("path = {any}", .{path.constSlice()});
-            //leaf.node.dumpTree(std.io.getStdErr().writer()) catch unreachable;
 
             const idx_is_in_leaf = leaf.idx < leaf_entries.len;
             if (idx_is_in_leaf and leaf_entries[leaf.idx].key == key) {

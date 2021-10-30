@@ -7,7 +7,7 @@ pub fn main() !void {
     defer t.end();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit());
+    defer std.debug.assert(!gpa.deinit());
 
     var arena = std.heap.ArenaAllocator.init(&gpa.allocator);
     defer arena.deinit();
@@ -37,12 +37,13 @@ pub fn main() !void {
         defer t_free.end();
 
         tree.deinit();
+        std.log.info("{} to deinit tree", .{std.fmt.fmtDuration(timer.read())});
     }
 
     const ns_to_construct = timer.read();
 
     // Write time
-    try writer.print("tree constructed in {}ns\n", .{ns_to_construct});
+    try writer.print("tree constructed in {}\n", .{std.fmt.fmtDuration(ns_to_construct)});
 
     // TODO: Query tree x times
     timer.reset();

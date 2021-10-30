@@ -26,6 +26,7 @@ const Benchmark = struct {
     name: []const u8,
     description: []const u8,
     path: []const u8,
+    sqlite: bool = false,
 };
 
 const benchmarks = [_]Benchmark{
@@ -38,6 +39,17 @@ const benchmarks = [_]Benchmark{
         .name = "space_used",
         .description = "Test how much space is used by the in-memory exponential tree",
         .path = "./benchmark/space_used.zig",
+    },
+    .{
+        .name = "sqlite_for_comparison",
+        .description = "Test against sqlite to get an idea of the relative speed",
+        .path = "./benchmark/sqlite_for_comparison.zig",
+        .sqlite = true,
+    },
+    .{
+        .name = "array_for_comparison",
+        .description = "Test against an array to get an idea of the relative speed",
+        .path = "./benchmark/sorted_array_for_comparison.zig",
     },
 };
 
@@ -89,6 +101,11 @@ pub fn build(b: *std.build.Builder) void {
         } else {
             benchmark.addPackage(DISK_KV_STORE_WITHOUT_TRACY);
             benchmark.addPackage(DUMMY_TRACY_PKG);
+        }
+
+        if (bench.sqlite) {
+            benchmark.linkSystemLibrary("sqlite3");
+            benchmark.linkLibC();
         }
 
         const benchmark_install = b.addInstallArtifact(benchmark);
