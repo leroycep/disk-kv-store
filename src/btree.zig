@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const io = std.io;
 
@@ -120,7 +121,7 @@ pub const FileBTree = struct {
                 unreachable; // Handle when a free list fills up
             }
 
-            if (std.builtin.mode == .Debug) {
+            if (builtin.mode == .Debug) {
                 // Check if the page number is already in the free list
                 var i: u64 = 0;
                 while (i < free_list_header.count) : (i += 1) {
@@ -138,7 +139,7 @@ pub const FileBTree = struct {
             try this.seekTo(free_list_page * PAGE_SIZE);
             try free_list_header.write(this);
 
-            if (std.builtin.mode == .Debug) {
+            if (builtin.mode == .Debug) {
                 try this.seekTo(pageNumber * PAGE_SIZE);
                 const debug_buffer = [_]u8{0xAA} ** PAGE_SIZE;
                 try this.writeAll(&debug_buffer);
