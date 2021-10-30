@@ -1,4 +1,5 @@
 const std = @import("std");
+const tracy = @import("tracy");
 
 pub fn Tree(comptime K: type, V: type) type {
     const MAX_PATH_LEN = 16;
@@ -7,12 +8,16 @@ pub fn Tree(comptime K: type, V: type) type {
         allocator: *std.mem.Allocator,
         rng: std.rand.DefaultPrng,
         root: ?*Node,
+        freeMemory: std.AutoHashMap(usize, std.ArrayList([*]align(@alignOf(*Node)) u8)),
+
+        const ThisTree = @This();
 
         pub fn init(allocator: *std.mem.Allocator) @This() {
             return @This(){
                 .allocator = allocator,
                 .rng = std.rand.DefaultPrng.init(std.crypto.random.int(u64)),
                 .root = null,
+                .freeMemory = std.AutoHashMap(usize, std.ArrayList([*]align(@alignOf(*Node)) u8)).init(allocator),
             };
         }
 
@@ -20,9 +25,48 @@ pub fn Tree(comptime K: type, V: type) type {
             if (this.root) |root| {
                 root.deinitRecursive(this.allocator);
             }
+
+            var iter = this.freeMemory.iterator();
+            while (iter.next()) |slots_of_size| {
+                const size = slots_of_size.key_ptr.*;
+                for (slots_of_size.value_ptr.items) |slot| {
+                    this.allocator.free(slot[0..size]);
+                }
+                slots_of_size.value_ptr.deinit();
+            }
+            this.freeMemory.deinit();
+        }
+
+        fn allocateMem(this: *@This(), size: usize) ![]align(@alignOf(*Node)) u8 {
+            attempt_reuse: {
+                const free_slots_entry = this.freeMemory.getEntry(size) orelse break :attempt_reuse;
+                const free_slots = free_slots_entry.value_ptr;
+                const slot = free_slots.popOrNull() orelse break :attempt_reuse;
+                return slot[0..size];
+            }
+
+            return try this.allocator.allocAdvanced(u8, @alignOf(*Node), size, .exact);
+        }
+
+        fn freeMem(this: *@This(), slice: []align(@alignOf(*Node)) u8) void {
+            attempt_reuse: {
+                const free_slots_entry = this.freeMemory.getOrPut(slice.len) catch break :attempt_reuse;
+                if (!free_slots_entry.found_existing) {
+                    free_slots_entry.value_ptr.* = std.ArrayList([*]align(@alignOf(*Node)) u8).init(this.allocator);
+                }
+                const free_slots = free_slots_entry.value_ptr;
+                free_slots.append(slice.ptr) catch break :attempt_reuse;
+                return;
+            }
+
+            this.allocator.free(slice);
+            return;
         }
 
         pub fn get(this: @This(), key: K) ?V {
+            const t = tracy.trace(@src());
+            defer t.end();
+
             if (this.root == null) return null;
             const path = this.pathToLocation(key) catch unreachable;
             const leaf = path.constSlice()[path.len - 1];
@@ -40,14 +84,17 @@ pub fn Tree(comptime K: type, V: type) type {
         }
 
         pub fn put(this: *@This(), key: K, val: V) !bool {
+            const t = tracy.trace(@src());
+            defer t.end();
+
             if (this.root != null) {
                 const path = try this.pathToLocation(key);
 
                 const leaf = path.constSlice()[path.len - 1];
                 const leaf_entries = leaf.node.asLeafEntryArray();
                 if (leaf.idx < leaf_entries.len and leaf_entries[leaf.idx].key == key) {
-                    const new_leaf = try leaf.node.dupe(this.allocator);
-                    errdefer new_leaf.deinit(this.allocator);
+                    const new_leaf = try leaf.node.dupe(this);
+                    errdefer new_leaf.free(this.allocator);
                     const new_leaf_entries = new_leaf.asLeafEntryArray();
                     new_leaf_entries[leaf.idx] = .{
                         .key = key,
@@ -56,19 +103,26 @@ pub fn Tree(comptime K: type, V: type) type {
                     return true;
                 }
 
-                var new_nodes = try leaf.node.dupeInsertOrSplitLeaf(this.allocator, leaf.idx, .{ .key = key, .val = val });
+                var new_nodes = try leaf.node.dupeInsertOrSplitLeaf(this, leaf.idx, .{ .key = key, .val = val });
                 errdefer {
                     for (new_nodes.constSlice()) |new_node| {
-                        new_node.deinitRecursive(this.allocator);
+                        new_node.freeRecursive(this);
                     }
                 }
 
+                // Update internal nodes
+                const t1 = tracy.trace(@src());
+
                 var path_idx = path.len - 1;
                 while (path_idx > 0) : (path_idx -= 1) {
+                    errdefer t1.end();
+
                     const path_segment = path.constSlice()[path_idx - 1];
                     const height = @intCast(u6, path.len - (path_idx - 1));
-                    new_nodes = try path_segment.node.dupeInsertOrSplitInternal(this.allocator, height, path_segment.idx, new_nodes.constSlice());
+                    new_nodes = try path_segment.node.dupeInsertOrSplitInternal(this, height, path_segment.idx, new_nodes.constSlice());
                 }
+
+                t1.end();
 
                 // TODO: Make this work for updating internal nodes
                 switch (new_nodes.len) {
@@ -76,7 +130,7 @@ pub fn Tree(comptime K: type, V: type) type {
                         this.root = new_nodes.constSlice()[0];
                     },
                     2 => {
-                        const new_internal = try Node.initLen(this.allocator, .internal, 2);
+                        const new_internal = try Node.initLen(this, .internal, 2);
 
                         const internal_entries = new_internal.asInternalEntryArray();
                         internal_entries[0] = .{
@@ -95,12 +149,18 @@ pub fn Tree(comptime K: type, V: type) type {
                     else => unreachable,
                 }
 
-                for (path.constSlice()) |path_segment| {
-                    path_segment.node.deinit(this.allocator);
+                // Free outdated path segments
+                {
+                    const t2 = tracy.trace(@src());
+                    defer t2.end();
+
+                    for (path.constSlice()) |path_segment| {
+                        path_segment.node.free(this);
+                    }
                 }
                 return false;
             } else {
-                this.root = try Node.initLen(this.allocator, .leaf, 1);
+                this.root = try Node.initLen(this, .leaf, 1);
                 this.root.?.asLeafEntryArray()[0] = .{
                     .key = key,
                     .val = val,
@@ -110,6 +170,9 @@ pub fn Tree(comptime K: type, V: type) type {
         }
 
         fn pathToLocation(this: @This(), key: K) !std.BoundedArray(PathSegment, MAX_PATH_LEN) {
+            const t = tracy.trace(@src());
+            defer t.end();
+
             std.debug.assert(this.root != null);
 
             const print_debug = false;
@@ -175,10 +238,10 @@ pub fn Tree(comptime K: type, V: type) type {
             nodeType: NodeType,
             len: usize,
 
-            pub fn initLen(allocator: *std.mem.Allocator, nodeType: NodeType, len: usize) !*@This() {
+            pub fn initLen(tree: *ThisTree, nodeType: NodeType, len: usize) !*@This() {
                 const node_size = nodeSize(nodeType, len);
 
-                const mem = try allocator.allocAdvanced(u8, @alignOf(@This()), node_size, .exact);
+                const mem = try tree.allocateMem(node_size);
 
                 const this = @ptrCast(*@This(), mem[0..@sizeOf(@This())]);
                 this.* = .{
@@ -189,24 +252,36 @@ pub fn Tree(comptime K: type, V: type) type {
                 return this;
             }
 
-            pub fn deinitRecursive(this: *const @This(), allocator: *std.mem.Allocator) void {
+            pub fn deinitRecursive(this: *@This(), allocator: *std.mem.Allocator) void {
                 if (this.nodeType == .internal) {
                     for (this.constInternalEntryArray()) |child| {
                         child.node.deinitRecursive(allocator);
                     }
                 }
-                this.deinit(allocator);
-            }
-
-            pub fn deinit(this: *const @This(), allocator: *std.mem.Allocator) void {
                 const node_size = nodeSize(this.nodeType, this.len);
-                const mem = @ptrCast([*]const u8, this)[0..node_size];
+                const mem = @ptrCast([*]u8, this)[0..node_size];
 
                 allocator.free(mem);
             }
 
-            pub fn dupe(this: *@This(), allocator: *std.mem.Allocator) !*@This() {
-                const new_this = try initLen(allocator, this.nodeType, this.len);
+            pub fn freeRecursive(this: *@This(), tree: *ThisTree) void {
+                if (this.nodeType == .internal) {
+                    for (this.constInternalEntryArray()) |child| {
+                        child.node.freeRecursive(tree);
+                    }
+                }
+                this.free(tree);
+            }
+
+            pub fn free(this: *@This(), tree: *ThisTree) void {
+                const node_size = nodeSize(this.nodeType, this.len);
+                const mem = @ptrCast([*]u8, this)[0..node_size];
+
+                tree.freeMem(mem);
+            }
+
+            pub fn dupe(this: *@This(), tree: *ThisTree) !*@This() {
+                const new_this = try initLen(tree, this.nodeType, this.len);
 
                 switch (this.nodeType) {
                     .internal => std.mem.copy(InternalEntry, new_this.asInternalEntryArray(), this.asInternalEntryArray()),
@@ -216,13 +291,16 @@ pub fn Tree(comptime K: type, V: type) type {
                 return new_this;
             }
 
-            pub fn dupeInsertOrSplitLeaf(this: *@This(), allocator: *std.mem.Allocator, idx: usize, newEntry: LeafEntry) !std.BoundedArray(*@This(), 2) {
+            pub fn dupeInsertOrSplitLeaf(this: *@This(), tree: *ThisTree, idx: usize, newEntry: LeafEntry) !std.BoundedArray(*@This(), 2) {
+                const t = tracy.trace(@src());
+                defer t.end();
+
                 std.debug.assert(this.nodeType == .leaf);
 
                 var new_nodes = std.BoundedArray(*@This(), 2){ .buffer = undefined };
                 errdefer {
                     for (new_nodes.slice()) |new_node| {
-                        new_node.deinit(allocator);
+                        new_node.free(tree);
                     }
                 }
 
@@ -235,7 +313,7 @@ pub fn Tree(comptime K: type, V: type) type {
                 const max_size = @as(usize, 1) << height;
                 if (this.len + 1 <= max_size) {
                     // Grow node by one
-                    const new_this = try initLen(allocator, this.nodeType, this.len + 1);
+                    const new_this = try initLen(tree, this.nodeType, this.len + 1);
                     const new_entries = new_this.asLeafEntryArray();
 
                     std.mem.copy(LeafEntry, new_entries[0..idx], entries[0..idx]);
@@ -267,8 +345,8 @@ pub fn Tree(comptime K: type, V: type) type {
                     // Split node into two
                     const half_size = max_size / 2;
 
-                    new_nodes.append(try initLen(allocator, this.nodeType, half_size)) catch unreachable;
-                    new_nodes.append(try initLen(allocator, this.nodeType, this.len + 1 - half_size)) catch unreachable;
+                    new_nodes.append(try initLen(tree, this.nodeType, half_size)) catch unreachable;
+                    new_nodes.append(try initLen(tree, this.nodeType, this.len + 1 - half_size)) catch unreachable;
 
                     if (idx < half_size) {
                         const left_node = new_nodes.slice()[1];
@@ -330,13 +408,16 @@ pub fn Tree(comptime K: type, V: type) type {
                 return new_nodes;
             }
 
-            pub fn dupeInsertOrSplitInternal(this: *@This(), allocator: *std.mem.Allocator, height: u6, idx: usize, newEntries: []const *@This()) !std.BoundedArray(*@This(), 2) {
+            pub fn dupeInsertOrSplitInternal(this: *@This(), tree: *ThisTree, height: u6, idx: usize, newEntries: []const *@This()) !std.BoundedArray(*@This(), 2) {
+                const t = tracy.trace(@src());
+                defer t.end();
+
                 std.debug.assert(this.nodeType == .internal);
 
                 var new_nodes = std.BoundedArray(*@This(), 2){ .buffer = undefined };
                 errdefer {
                     for (new_nodes.slice()) |new_node| {
-                        new_node.deinit(allocator);
+                        new_node.free(tree);
                     }
                 }
 
@@ -346,7 +427,7 @@ pub fn Tree(comptime K: type, V: type) type {
                 const new_len = this.len + newEntries.len - 1;
                 if (new_len < max_size) {
                     // Grow node by one
-                    const new_this = try initLen(allocator, this.nodeType, new_len);
+                    const new_this = try initLen(tree, this.nodeType, new_len);
                     new_nodes.append(new_this) catch unreachable;
 
                     const new_entries = new_this.asInternalEntryArray();
@@ -365,8 +446,8 @@ pub fn Tree(comptime K: type, V: type) type {
                     // Split node into two
                     const half_size = max_size / 2;
 
-                    new_nodes.append(try initLen(allocator, this.nodeType, half_size)) catch unreachable;
-                    new_nodes.append(try initLen(allocator, this.nodeType, this.len + 1 - half_size)) catch unreachable;
+                    new_nodes.append(try initLen(tree, this.nodeType, half_size)) catch unreachable;
+                    new_nodes.append(try initLen(tree, this.nodeType, this.len + 1 - half_size)) catch unreachable;
 
                     const print_debug = false;
                     if (print_debug) std.debug.print("\n\n", .{});
@@ -626,8 +707,8 @@ test "put in keys and values and retrieve by key" {
         .{ .key = -5102797669907719704, .val = -2995794415761794483 },
     });
 
-    // Case that found memory leak. Memory leak turned out to be calling `deinit`
-    // on child nodes instead of deinitRecursive.
+    // Case that found memory leak. Memory leak turned out to be calling `free`
+    // on child nodes instead of freeRecursive.
     try cases.append(&.{
         .{ .key = -290458009884207260, .val = -9186000433903606205 },
         .{ .key = -8544764128017980972, .val = -8642126939529302081 },
