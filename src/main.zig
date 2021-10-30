@@ -3,6 +3,7 @@ const testing = std.testing;
 const fs = std.fs;
 const btree = @import("btree.zig");
 const path_trie = @import("path_trie.zig");
+pub const mem_cow_exponential_generic = @import("./mem_cow_exponential_generic.zig");
 
 pub const Database = struct {
     file: fs.File,

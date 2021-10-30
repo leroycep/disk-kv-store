@@ -1,0 +1,6 @@
+[submodule "lib/tracy/zig-tracy"]
+	path = lib/tracy/zig-tracy
+	url = https://github.com/nektro/zig-tracy.git
+[submodule "lib/tracy/tracy"]
+	path = lib/tracy/tracy
+	url = https://github.com/wolfpld/tracy.git
