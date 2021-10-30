@@ -10,3 +10,7 @@
 - Size allocations based on height?
     - Would this reduce the amount of unusable space in the tree? Is this
       even something that needs to be worried about?
+- Freeing memory from the tree takes a long time ATM (commit bf4c2e96140373cc74a0bf971c4d28ec0a01a948)
+    - Probably because of the sheer number of allocations created
+    - Possible solution: slab allocation
+        - Way to make cache-oblivious?
