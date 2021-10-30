@@ -30,21 +30,27 @@ pub fn main() !void {
     var timer = try std.time.Timer.start();
 
     // Construct tree
-    const array = try gpa.allocator.alloc(Entry, count);
-    defer gpa.allocator.free(array);
+    var array = std.ArrayList(Entry).init(&gpa.allocator);
+    defer array.deinit();
 
-    for (array) |*entry| {
-        entry.* = .{
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const new_entry = Entry{
             .key = random.int(i64),
             .val = random.int(i64),
         };
+        const search_result = binarySearch(Entry, new_entry, array.items, {}, entryOrder);
+        if (search_result.foundExisting) {
+            array.items[search_result.index] = new_entry;
+        } else {
+            try array.insert(search_result.index, new_entry);
+        }
     }
-
-    std.sort.sort(Entry, array, {}, entryLessThan);
+    std.debug.assert(std.sort.isSorted(Entry, array.items, {}, entryLessThan));
 
     // Write time
     const ns_to_construct = timer.read();
-    try writer.print("tree constructed in {}\n", .{std.fmt.fmtDuration(ns_to_construct)});
+    try writer.print("array constructed in {}\n", .{std.fmt.fmtDuration(ns_to_construct)});
 
     // TODO: Query tree x times
     timer.reset();
@@ -57,7 +63,42 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
     return a.key < b.key;
 }
 
+fn entryOrder(_: void, a: Entry, b: Entry) math.Order {
+    return std.math.order(a.key, b.key);
+}
+
 const Entry = struct {
     key: i64,
     val: i64,
 };
+
+const math = std.math;
+
+const SearchResult = struct {
+    index: usize,
+    foundExisting: bool,
+};
+
+pub fn binarySearch(
+    comptime T: type,
+    key: T,
+    items: []const T,
+    context: anytype,
+    comptime compareFn: fn (context: @TypeOf(context), lhs: T, rhs: T) math.Order,
+) SearchResult {
+    var left: usize = 0;
+    var right: usize = items.len;
+
+    while (left < right) {
+        // Avoid overflowing in the midpoint calculation
+        const mid = left + (right - left) / 2;
+        // Compare the key with the midpoint element
+        switch (compareFn(context, key, items[mid])) {
+            .eq => return .{ .index = mid, .foundExisting = true },
+            .gt => left = mid + 1,
+            .lt => right = mid,
+        }
+    }
+
+    return .{ .index = left, .foundExisting = false };
+}
