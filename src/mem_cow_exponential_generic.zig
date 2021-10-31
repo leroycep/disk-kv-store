@@ -161,24 +161,18 @@ pub fn Tree(comptime K: type, V: type) type {
 
             std.debug.assert(this.root != null);
 
-            const print_debug = false;
-
             var path = std.BoundedArray(PathSegment, MAX_PATH_LEN).init(0) catch unreachable;
             path.append(.{ .node = this.root.?, .idx = undefined }) catch unreachable;
             while (true) {
                 const current = &path.slice()[path.len - 1];
-
-                if (print_debug) std.log.warn("looking at {*} {}", .{ current.node, current.node });
 
                 if (current.node.nodeType == .leaf) break;
 
                 const entries = current.node.asInternalEntryArray();
                 var idx: usize = 0;
                 while (idx < current.node.len) : (idx += 1) {
-                    if (print_debug) std.log.warn("entries[{}] = {*}", .{ idx, entries[idx].node });
                     if (entries[idx].key > key) {
                         current.idx = if (idx > 0) idx - 1 else 0;
-                        if (print_debug) std.log.warn("appending {} node = {*}", .{ current.idx, entries[idx].node });
                         try path.append(.{
                             .idx = undefined,
                             .node = entries[current.idx].node,
@@ -188,14 +182,12 @@ pub fn Tree(comptime K: type, V: type) type {
                 } else {
                     std.debug.assert(entries.len > 0); // There should be no nodes with 0 children
                     current.idx = entries.len - 1;
-                    if (print_debug) std.log.warn("appending {}", .{current.idx});
                     try path.append(.{
                         .idx = undefined,
                         .node = entries[current.idx].node,
                     });
                 }
             }
-            if (print_debug) std.log.warn("{} path len = {}", .{ @src().line, path.len });
 
             const segment = &path.slice()[path.len - 1];
             std.debug.assert(segment.node.nodeType == .leaf);
