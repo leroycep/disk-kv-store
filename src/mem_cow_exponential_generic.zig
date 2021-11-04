@@ -1,5 +1,6 @@
 const std = @import("std");
 const tracy = @import("tracy");
+const eytzinger = @import("./eytzinger.zig");
 
 pub fn Tree(comptime K: type, V: type) type {
     const MAX_PATH_LEN = 16;
@@ -776,4 +777,8 @@ test "put in keys and values and retrieve by key" {
     }
 
     if (skipped_cases == cases.items.len) return error.SkipZigTest;
+}
+
+comptime {
+    _ = eytzinger;
 }
