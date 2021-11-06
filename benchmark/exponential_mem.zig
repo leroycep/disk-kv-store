@@ -2,6 +2,7 @@ const std = @import("std");
 const Tree = @import("disk-kv-store").mem_cow_exponential_generic.Tree;
 const tracy = @import("tracy");
 const utils = @import("./benchmark_utils.zig");
+const clap = @import("clap");
 
 pub fn main() !void {
     const t = tracy.trace(@src());
@@ -13,11 +14,36 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(&gpa.allocator);
     defer arena.deinit();
 
-    // Get argument values
-    const seed = std.crypto.random.int(u64);
-    const count = 1_000_000;
-    const random_queries = 5_000_000;
-    const from_entries_queries = 5_000_000;
+    // Set default argument values
+    var seed = std.crypto.random.int(u64);
+    var count: u64 = 1_000_000;
+    var random_queries: u64 = 5_000_000;
+    var from_entries_queries: u64 = 5_000_000;
+
+    // Parse command line arguments
+    {
+        const params = comptime [_]clap.Param(clap.Help){
+            clap.parseParam("-h, --help                    Display this help and exit") catch unreachable,
+            clap.parseParam("-s, --seed <NUM>              Set the psuedo-random seed") catch unreachable,
+            clap.parseParam("-c, --count <NUM>             Set the number of values to insert") catch unreachable,
+            clap.parseParam("-r, --queries-random <NUM>    Set the number of random values to query the tree with") catch unreachable,
+            clap.parseParam("-e, --queries-existing <NUM>  Set the number of existing values to query the tree with") catch unreachable,
+        };
+
+        var args = try clap.parse(clap.Help, &params, .{});
+        defer args.deinit();
+
+        if (args.flag("--help"))
+            return try clap.help(std.io.getStdErr().writer(), &params);
+        if (args.option("--seed")) |n|
+            seed = try std.fmt.parseInt(u64, n, 10);
+        if (args.option("--count")) |n|
+            count = try std.fmt.parseInt(u64, n, 10);
+        if (args.option("--queries-random")) |n|
+            random_queries = try std.fmt.parseInt(u64, n, 10);
+        if (args.option("--queries-existing")) |n|
+            from_entries_queries = try std.fmt.parseInt(u64, n, 10);
+    }
 
     const stdout = std.io.getStdOut();
     const writer = stdout.writer();

@@ -4,3 +4,6 @@
 [submodule "lib/tracy/tracy"]
 	path = lib/tracy/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "lib/zig-clap"]
+	path = lib/zig-clap
+	url = https://github.com/Hejsil/zig-clap

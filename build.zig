@@ -22,6 +22,11 @@ const DISK_KV_STORE_WITHOUT_TRACY = std.build.Pkg{
     .dependencies = &.{DUMMY_TRACY_PKG},
 };
 
+const ZIG_CLAP_PKG = std.build.Pkg{
+    .name = "clap",
+    .path = .{ .path = "./lib/zig-clap/clap.zig" },
+};
+
 const Benchmark = struct {
     name: []const u8,
     description: []const u8,
@@ -89,6 +94,8 @@ pub fn build(b: *std.build.Builder) void {
         benchmark.setBuildMode(mode);
         benchmark.setTarget(benchmark_target);
 
+        benchmark.addPackage(ZIG_CLAP_PKG);
+
         if (tracy_enabled) {
             benchmark.addPackage(DISK_KV_STORE_WITH_TRACY);
             benchmark.addPackage(TRACY_PKG);
@@ -114,6 +121,10 @@ pub fn build(b: *std.build.Builder) void {
         build_benchmark_step.dependOn(&benchmark_install.step);
 
         const benchmark_run = benchmark.run();
+        if (b.args) |args| {
+            benchmark_run.addArgs(args);
+        }
+
         const run_step = b.step("benchmark-run-" ++ bench.name, "(Run) " ++ bench.description);
         run_step.dependOn(&benchmark_run.step);
 
