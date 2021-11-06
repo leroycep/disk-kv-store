@@ -1,6 +1,7 @@
 const std = @import("std");
 const Tree = @import("disk-kv-store").mem_cow_exponential_generic.Tree;
 const tracy = @import("tracy");
+const utils = @import("./benchmark_utils.zig");
 
 pub fn main() !void {
     const t = tracy.trace(@src());
@@ -30,7 +31,7 @@ pub fn main() !void {
     var prng = std.rand.DefaultPrng.init(seed);
     const random = &prng.random;
 
-    const entries = try makeEntries(&arena.allocator, random, count);
+    const entries = try utils.makeEntries(&arena.allocator, random, count);
 
     var entries_hashmap = std.AutoHashMap(i64, i64).init(&arena.allocator);
     try entries_hashmap.ensureTotalCapacity(@intCast(u32, entries.len));
@@ -66,26 +67,7 @@ pub fn main() !void {
     try writer.print("done\n", .{});
 }
 
-const Entry = struct {
-    key: i64,
-    val: i64,
-};
-
-pub fn makeEntries(allocator: *std.mem.Allocator, random: *std.rand.Random, count: usize) ![]Entry {
-    const entries = try allocator.alloc(Entry, count);
-    errdefer allocator.free(entries);
-
-    for (entries) |*entry| {
-        entry.* = .{
-            .key = random.int(i64),
-            .val = random.int(i64),
-        };
-    }
-
-    return entries;
-}
-
-pub fn construct(allocator: *std.mem.Allocator, entries: []const Entry) !Tree(i64, i64) {
+pub fn construct(allocator: *std.mem.Allocator, entries: []const utils.Entry) !Tree(i64, i64) {
     const t = tracy.trace(@src());
     defer t.end();
 
@@ -117,7 +99,7 @@ pub fn randomQueries(tree: Tree(i64, i64), truth: std.AutoHashMap(i64, i64), ran
     }
 }
 
-pub fn fromEntriesQueries(tree: Tree(i64, i64), entries: []const Entry, random: *std.rand.Random, count: usize) !void {
+pub fn fromEntriesQueries(tree: Tree(i64, i64), entries: []const utils.Entry, random: *std.rand.Random, count: usize) !void {
     const t = tracy.trace(@src());
     defer t.end();
 

@@ -2,10 +2,14 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
+const utils = @import("./benchmark_utils.zig");
 
 pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(!gpa.deinit());
+
+    var arena = std.heap.ArenaAllocator.init(&gpa.allocator);
+    defer arena.deinit();
 
     const db_path_z: [:0]const u8 = ":memory:";
 
@@ -14,14 +18,26 @@ pub fn main() !u8 {
 
     const stdout = std.io.getStdOut();
     const writer = stdout.writer();
+    const random_queries = 5_000_000;
+    const from_entries_queries = 5_000_000;
 
-    try writer.print("running exponential_mem benchmark\n", .{});
+    try writer.print("running sqlite for comparison benchmark\n", .{});
     try writer.print("\tdb path = {s}\n", .{db_path_z});
     try writer.print("\tseed = {}\n", .{seed});
     try writer.print("\tcount = {}\n", .{count});
+    try writer.print("\trandom queries = {}\n", .{random_queries});
+    try writer.print("\tqueries from list of entries = {}\n", .{from_entries_queries});
 
     var prng = std.rand.DefaultPrng.init(seed);
     const random = &prng.random;
+
+    const entries = try utils.makeEntries(&arena.allocator, random, count);
+
+    var entries_hashmap = std.AutoHashMap(i64, i64).init(&arena.allocator);
+    try entries_hashmap.ensureTotalCapacity(@intCast(u32, entries.len));
+    for (entries) |entry| {
+        entries_hashmap.putAssumeCapacity(entry.key, entry.val);
+    }
 
     var timer = try std.time.Timer.start();
 
@@ -54,27 +70,38 @@ pub fn main() !u8 {
         return 1;
     }
 
+    const SELECT_SQL =
+        \\SELECT val FROM key_vals WHERE key = ?;
+    ;
+    var select_stmt: ?*c.sqlite3_stmt = null;
+    defer _ = c.sqlite3_finalize(select_stmt);
+    if (c.sqlite3_prepare_v2(db, SELECT_SQL, SELECT_SQL.len, &select_stmt, null) != c.SQLITE_OK) {
+        std.log.err("Can't prepare select statment: {s}", .{c.sqlite3_errmsg(db)});
+        return 1;
+    }
+
     const ns_to_prepare = timer.read();
     try writer.print("table and statement prepared in {}\n", .{std.fmt.fmtDuration(ns_to_prepare)});
     timer.reset();
 
-    if (c.sqlite3_exec(db, "BEGIN;", null, null, null) != 0) {
+    if (false and c.sqlite3_exec(db, "BEGIN TRANSACTION;", null, null, null) != c.SQLITE_OK) {
         std.log.err("Can't execute init SQL: {s}", .{c.sqlite3_errmsg(db)});
         return 1;
     }
 
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        _ = c.sqlite3_reset(stmt);
-        _ = c.sqlite3_clear_bindings(stmt);
+    {
+        for (entries) |entry| {
+            _ = c.sqlite3_reset(stmt);
+            _ = c.sqlite3_clear_bindings(stmt);
 
-        std.debug.assert(c.sqlite3_bind_int64(stmt, 1, random.int(i64)) == c.SQLITE_OK);
-        std.debug.assert(c.sqlite3_bind_int64(stmt, 2, random.int(i64)) == c.SQLITE_OK);
+            std.debug.assert(c.sqlite3_bind_int64(stmt, 1, entry.key) == c.SQLITE_OK);
+            std.debug.assert(c.sqlite3_bind_int64(stmt, 2, entry.val) == c.SQLITE_OK);
 
-        std.debug.assert(c.sqlite3_step(stmt) == c.SQLITE_DONE);
+            std.debug.assert(c.sqlite3_step(stmt) == c.SQLITE_DONE);
+        }
     }
 
-    if (c.sqlite3_exec(db, "COMMIT;", null, null, null) != 0) {
+    if (false and c.sqlite3_exec(db, "END TRANSACTION;", null, null, null) != c.SQLITE_OK) {
         std.log.err("Can't execute init SQL: {s}", .{c.sqlite3_errmsg(db)});
         return 1;
     }
@@ -83,6 +110,62 @@ pub fn main() !u8 {
 
     // Write time
     try writer.print("keys and values inserted in {}\n", .{std.fmt.fmtDuration(ns_to_construct)});
+
+    // Query table with random keys
+    timer.reset();
+    {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            _ = c.sqlite3_reset(select_stmt);
+            _ = c.sqlite3_clear_bindings(select_stmt);
+
+            const key = random.int(i64);
+            std.debug.assert(c.sqlite3_bind_int64(select_stmt, 1, key) == c.SQLITE_OK);
+
+            switch (c.sqlite3_step(select_stmt)) {
+                c.SQLITE_DONE => {},
+                c.SQLITE_ROW => {
+                    const result = c.sqlite3_column_int64(select_stmt, 0);
+                    try std.testing.expectEqual(entries_hashmap.get(key), result);
+                },
+                else => {
+                    std.log.err("Error returned while select key {}: {s}", .{ key, c.sqlite3_errmsg(db) });
+                    return 1;
+                },
+            }
+        }
+    }
+    const ns_to_query_random = timer.read();
+
+    try writer.print("tree answered random queries in {}\n", .{std.fmt.fmtDuration(ns_to_query_random)});
+
+    timer.reset();
+    {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            errdefer std.log.err("In query {}", .{i});
+            _ = c.sqlite3_reset(select_stmt);
+            _ = c.sqlite3_clear_bindings(select_stmt);
+
+            const entry_idx = random.uintLessThan(usize, entries.len);
+            const key = entries[entry_idx].key;
+            std.debug.assert(c.sqlite3_bind_int64(select_stmt, 1, key) == c.SQLITE_OK);
+
+            const expected = entries_hashmap.get(key);
+            const result: ?i64 = switch (c.sqlite3_step(select_stmt)) {
+                c.SQLITE_DONE => null,
+                c.SQLITE_ROW => c.sqlite3_column_int64(select_stmt, 0),
+                else => {
+                    std.log.err("Error returned while select key {}: {s}", .{ key, c.sqlite3_errmsg(db) });
+                    return 1;
+                },
+            };
+
+            try std.testing.expectEqual(expected, result);
+        }
+    }
+    const ns_to_query_existing = timer.read();
+    try writer.print("tree answered existing queries in {}\n", .{std.fmt.fmtDuration(ns_to_query_existing)});
 
     return 0;
 }
