@@ -1,15 +1,15 @@
 const std = @import("std");
 
-fn parent(idx: u32) u32 {
+pub fn parent(idx: u32) u32 {
     std.debug.assert(idx > 0);
     return (idx - 1) / 2;
 }
 
-fn left(idx: u32) u32 {
+pub fn left(idx: u32) u32 {
     return 2 * idx + 1;
 }
 
-fn right(idx: u32) u32 {
+pub fn right(idx: u32) u32 {
     return 2 * idx + 2;
 }
 
@@ -46,17 +46,17 @@ fn next(idx: u32, len: u32) ?u32 {
     }
 }
 
-fn fromLinear(indexLinear: u32, len: u32) u32 {
+pub fn fromLinear(indexLinear: u32, len: u32) u32 {
     std.debug.assert(len > 0);
     std.debug.assert(indexLinear < len);
 
     if (len == 1) return 0;
 
-    const height = std.math.log2_int_ceil(u32, len);
+    const height = std.math.log2_int_ceil(u32, len + 1);
 
     // Account for incomplete bottom layer
-    const num_nodes_in_complete_bottom = (@as(u32, 1) << @intCast(u5, height)) - 1;
-    const num_missing = num_nodes_in_complete_bottom - len;
+    const num_nodes_in_complete = (@as(u32, 1) << @intCast(u5, height)) - 1;
+    const num_missing = num_nodes_in_complete - len;
     const missing_starts = len - num_missing;
     const index_adjusted = indexLinear + (indexLinear -| missing_starts);
 
@@ -67,14 +67,14 @@ fn fromLinear(indexLinear: u32, len: u32) u32 {
     return layer_start_index + pos_in_layer;
 }
 
-fn toLinear(indexEytzinger: u32, len: u32) u32 {
+pub fn toLinear(indexEytzinger: u32, len: u32) u32 {
     std.debug.assert(len > 0);
     std.debug.assert(indexEytzinger < len);
 
     if (len == 1) return 0;
 
     const l = std.math.log2_int_ceil(u32, indexEytzinger + 2);
-    const h = std.math.log2_int_ceil(u32, len);
+    const h = std.math.log2_int_ceil(u32, len + 1);
 
     const half_stride = (@as(u32, 1) << @intCast(u5, h - l));
     const layer_start_index = (@as(u32, 1) << @intCast(u5, l - 1)) - 1;
