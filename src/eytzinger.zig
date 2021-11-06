@@ -53,17 +53,21 @@ fn fromLinear(indexLinear: u32, len: u32) u32 {
     if (len == 1) return 0;
 
     const height = std.math.log2_int_ceil(u32, len);
-    const layer = height - @ctz(u32, indexLinear + 1);
 
+    // Account for incomplete bottom layer
+    const num_nodes_in_complete_bottom = (@as(u32, 1) << @intCast(u5, height)) - 1;
+    const num_missing = num_nodes_in_complete_bottom - len;
+    const missing_starts = len - num_missing;
+    const index_adjusted = indexLinear + (indexLinear -| missing_starts);
+
+    const layer = height - @ctz(u32, index_adjusted + 1);
     const layer_start_index = (@as(u32, 1) << @intCast(u5, layer - 1)) - 1;
-
-    const pos_in_layer = (indexLinear >> @intCast(u5, height - layer + 1));
+    const pos_in_layer = (index_adjusted >> @intCast(u5, height - layer + 1));
 
     return layer_start_index + pos_in_layer;
 }
 
 fn toLinear(indexEytzinger: u32, len: u32) u32 {
-    // TODO: Account for incomplete layers
     std.debug.assert(len > 0);
     std.debug.assert(indexEytzinger < len);
 
@@ -78,7 +82,12 @@ fn toLinear(indexEytzinger: u32, len: u32) u32 {
     const pos_in_layer = indexEytzinger - layer_start_index;
     const stride_of_layer = half_stride << 1;
 
-    return half_stride - 1 + pos_in_layer * stride_of_layer;
+    // Account for incomplete bottom layer
+    const start_of_bottom = (@as(u32, 1) << @intCast(u5, h - 1)) - 1;
+    const num_nodes_in_bottom_layer_before_index = half_stride * pos_in_layer + (half_stride / 2);
+    const num_missing_before_index = num_nodes_in_bottom_layer_before_index + start_of_bottom -| len;
+
+    return half_stride - 1 + pos_in_layer * stride_of_layer - num_missing_before_index;
 }
 
 test "linear/eytzinger index conversion" {
@@ -100,7 +109,7 @@ test "fuzz linear/eytzinger index conversion" {
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const len = (@as(u32, 1) << prng.random.int(u5)) - 1;
+        const len = prng.random.int(u31);
         if (len == 0) continue;
         const linear_idx = prng.random.uintLessThan(u32, len);
         try testLinearEytzingerConversion(linear_idx, len);
